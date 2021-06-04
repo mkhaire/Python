@@ -1,3 +1,5 @@
+## Reference taken from https://pillow.readthedocs.io/en/latest/handbook/tutorial.html#create-jpeg-thumbnails
+
 import os
 import tempfile
 
