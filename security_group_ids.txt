@@ -1,0 +1,6 @@
+#Sample SG group Id's
+sg-0dcffd588a2c198b9
+sg-0f8435d2eb6bd3e18
+sg-0f42274cfd76edda8
+sg-0377dd29184edc0bb
+sg-0ad579b466e69b1a7
