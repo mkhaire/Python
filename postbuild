@@ -1,0 +1,28 @@
+post {
+    failure {
+        script {
+            echo 'Build failed! Initiating AI Analysis...'
+            withCredentials([string(credentialsId: 'azure-openai-key', variable: 'AZURE_OPENAI_KEY')]) {
+                // 1. Create a virtual environment
+                sh '''
+                    python3 -m venv ai_env
+                    . ai_env/bin/activate
+                    pip install requests openai
+                    
+                    # 2. Run the script using the venv python
+                    python jenkins_ai_doctor.py
+                '''
+                
+                // 3. Publish Report
+                publishHTML (target: [
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: '.',
+                    reportFiles: 'ai_report.html',
+                    reportName: 'AI Failure Analysis'
+                ])
+            }
+        }
+    }
+}

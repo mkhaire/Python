@@ -1,0 +1,211 @@
+import os
+import re
+import json
+import requests
+from openai import AzureOpenAI
+
+# --- Configuration ---
+# In a real environment, ensure these are set as env variables
+JENKINS_URL = os.getenv("JENKINS_BUILD_URL") 
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_KEY")
+DEPLOYMENT_NAME = "gpt-4-deployment" # Replace with your Azure deployment name
+
+# System Prompt to enforce strict JSON output
+SYSTEM_PROMPT = """
+You are a Senior DevOps Engineer and Jenkins Expert. Your role is to analyze build logs and identify the root cause of failure.
+
+**STRICT RULES:**
+1. **Evidence Based:** You must cite the specific line from the log that indicates the error.
+2. **No Guessing:** If the log snippet does not contain the error source, return "status": "INCONCLUSIVE" and request more logs. Do not invent a fix.
+3. **Safe Fixes:** Only suggest standard, verified CLI commands or code changes. Do not suggest experimental flags.
+4. **Format:** You MUST output valid JSON only. No conversational text before or after the JSON.
+
+**JSON OUTPUT STRUCTURE:**
+{
+  "status": "SUCCESS" or "INCONCLUSIVE",
+  "error_type": "Brief category (e.g., Maven Dependency Error, Syntax Error, Timeout)",
+  "root_cause": "A 1-2 sentence explanation of WHAT went wrong.",
+  "log_evidence": "The exact line from the log triggering the error.",
+  "suggested_fix": "Step-by-step instructions to fix it.",
+  "fix_code": "The exact command or code snippet to run (if applicable)."
+}
+"""
+
+def get_jenkins_log(build_url):
+    """Retrieves console text from Jenkins."""
+    if not build_url:
+        print("JENKINS_BUILD_URL not set. Using dummy data for testing.")
+        return ""
+        
+    log_url = f"{build_url.rstrip('/')}/consoleText"
+    print(f"Fetching log from: {log_url}")
+    
+    try:
+        # Add auth if needed: requests.get(log_url, auth=('user', 'token'))
+        response = requests.get(log_url, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching log: {e}")
+        return ""
+
+def sanitize_log(log_text):
+    """
+    Removes sensitive info like IPs and AWS keys before sending to AI.
+    """
+    # Regex for IPs
+    log_text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '[REDACTED_IP]', log_text)
+    # Regex for generic secrets (long alphanumeric strings)
+    log_text = re.sub(r'(?<![A-Za-z0-9])[A-Za-z0-9]{20,}(?![A-Za-z0-9])', '[REDACTED_SECRET]', log_text)
+    return log_text
+
+def extract_error_context(log_text):
+    """
+    Extracts a window around the last occurrence of common error keywords.
+    """
+    if not log_text: return ""
+
+    lines = log_text.split('\n')
+    error_keywords = ["ERROR", "FAILURE", "Exception", "Build failed", "FATAL"]
+    
+    # Reverse search to find the most recent error
+    for i, line in enumerate(reversed(lines)):
+        if any(keyword in line for keyword in error_keywords):
+            # Capture 50 lines before and 20 lines after the error
+            actual_index = len(lines) - 1 - i
+            start = max(0, actual_index - 50)
+            end = min(len(lines), actual_index + 20)
+            return "\n".join(lines[start:end])
+            
+    # Fallback: Return last 50 lines if no keyword found
+    return "\n".join(lines[-50:])
+
+def analyze_with_ai(error_snippet):
+    """Sends the sanitized log snippet to Azure OpenAI."""
+    if not error_snippet.strip():
+        return json.dumps({
+            "status": "INCONCLUSIVE",
+            "root_cause": "Empty log or unable to extract error context.",
+            "error_type": "Log Retrieval Error"
+        })
+
+    client = AzureOpenAI(
+        azure_endpoint=AZURE_ENDPOINT, 
+        api_key=AZURE_API_KEY,  
+        api_version="2023-05-15"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Here is the failed build log snippet:\n\n{error_snippet}"}
+            ],
+            temperature=0.1, 
+            max_tokens=800
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"AI Analysis failed: {e}")
+        return json.dumps({
+            "status": "INCONCLUSIVE", 
+            "root_cause": f"Azure OpenAI API Error: {str(e)}",
+            "error_type": "API Error"
+        })
+
+def generate_html_report(ai_response_text):
+    """Generates an HTML report from the AI's JSON response."""
+    # Clean response to ensure it parses as JSON
+    clean_text = ai_response_text.strip().strip('`').replace('json\n', '')
+    
+    try:
+        data = json.loads(clean_text)
+    except json.JSONDecodeError:
+        data = {
+            "status": "INCONCLUSIVE", 
+            "error_type": "Parsing Error",
+            "root_cause": "The AI returned a response that was not valid JSON.", 
+            "suggested_fix": "Check the raw AI output in console.",
+            "raw_output": ai_response_text
+        }
+
+    # Set colors based on status
+    is_success = data.get("status") == "SUCCESS"
+    header_color = "#28a745" if is_success else "#dc3545" # Green or Red
+    icon = "✅" if is_success else "🚨"
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Jenkins AI Analysis</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; }}
+            .container {{ max-width: 900px; margin: 0 auto; background: white; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); overflow: hidden; }}
+            .header {{ background-color: {header_color}; color: white; padding: 20px; text-align: center; }}
+            .header h1 {{ margin: 0; font-size: 24px; }}
+            .content {{ padding: 30px; }}
+            .card {{ background: #fff; border: 1px solid #e1e4e8; border-radius: 6px; margin-bottom: 20px; padding: 20px; }}
+            .card h3 {{ margin-top: 0; color: #2c3e50; font-size: 16px; border-bottom: 2px solid #f0f0f0; padding-bottom: 10px; }}
+            .evidence-box {{ background-color: #fff3cd; color: #856404; padding: 15px; border-left: 5px solid #ffeeba; font-family: monospace; white-space: pre-wrap; }}
+            .code-block {{ background-color: #282c34; color: #abb2bf; padding: 15px; border-radius: 5px; font-family: monospace; overflow-x: auto; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>{icon} Build Failure Analysis</h1>
+                <p><strong>Type:</strong> {data.get('error_type', 'Unknown')}</p>
+            </div>
+            <div class="content">
+                <div class="card">
+                    <h3>🔍 Root Cause</h3>
+                    <p>{data.get('root_cause', 'No cause identified.')}</p>
+                </div>
+                <div class="card">
+                    <h3>📄 Log Evidence</h3>
+                    <div class="evidence-box">{data.get('log_evidence', 'No specific log lines cited.')}</div>
+                </div>
+                <div class="card">
+                    <h3>💡 Suggested Fix</h3>
+                    <p>{data.get('suggested_fix', 'No fix provided.')}</p>
+                    <h4>Command / Code:</h4>
+                    <div class="code-block">{data.get('fix_code', '# No code snippet provided')}</div>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    output_file = "ai_report.html"
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print(f"HTML Report successfully generated: {output_file}")
+
+if __name__ == "__main__":
+    print("--- Starting AI Doctor ---")
+    
+    # 1. Get Log
+    raw_log = get_jenkins_log(JENKINS_URL)
+    
+    # 2. Extract & Sanitize
+    if raw_log:
+        error_context = extract_error_context(raw_log)
+        clean_context = sanitize_log(error_context)
+        
+        # 3. Analyze
+        print("--- Analyzing with Azure OpenAI ---")
+        analysis_json = analyze_with_ai(clean_context)
+        
+        # 4. Generate HTML
+        print("--- Generating Report ---")
+        generate_html_report(analysis_json)
+    else:
+        print("No log content found or URL invalid.")
+    
+    print("--- Done ---")
